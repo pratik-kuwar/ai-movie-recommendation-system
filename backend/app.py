@@ -13,7 +13,13 @@ load_dotenv(Path(__file__).with_name('.env'))
 TMDB_TOKEN = os.getenv('TMDB_TOKEN', '')
 TMDB_API_KEY = os.getenv('TMDB_API_KEY', '')
 app = Flask(__name__)
-CORS(app, origins=['http://localhost:5173', 'http://127.0.0.1:5173'])
+allowed_origins = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'https://ai-movie-recommendation-system-six.vercel.app',
+]
+allowed_origins.extend(origin.strip().rstrip('/') for origin in os.getenv('FRONTEND_ORIGINS', '').split(',') if origin.strip())
+CORS(app, origins=allowed_origins)
 movies = load_movies()
 cache = {}
 

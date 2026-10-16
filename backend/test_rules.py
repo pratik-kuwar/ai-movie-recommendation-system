@@ -44,6 +44,11 @@ class RulesTest(unittest.TestCase):
             r=c.post('/recommend',json={'genre':'Comedy'},headers={'Origin':'http://localhost:5173'})
         self.assertEqual(r.status_code,200);self.assertTrue(r.json['recommendations'])
         self.assertEqual(r.headers['Access-Control-Allow-Origin'],'http://localhost:5173')
+        public=app.test_client().get('/filters',headers={'Origin':'https://ai-movie-recommendation-system-six.vercel.app'})
+        self.assertEqual(public.headers['Access-Control-Allow-Origin'],'https://ai-movie-recommendation-system-six.vercel.app')
+        preflight=app.test_client().options('/recommend',headers={'Origin':'https://ai-movie-recommendation-system-six.vercel.app','Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'content-type'})
+        self.assertEqual(preflight.headers['Access-Control-Allow-Origin'],'https://ai-movie-recommendation-system-six.vercel.app')
+        self.assertIn('content-type',preflight.headers['Access-Control-Allow-Headers'].lower())
     def test_network_and_auth_failures(self):
         with patch('app.TMDB_TOKEN','test'),patch('app.requests.get',side_effect=requests.Timeout):
             self.assertIn('timed out',tmdb('movie/1')[1])
