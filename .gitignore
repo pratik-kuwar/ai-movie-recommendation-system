@@ -2,3 +2,9 @@ backend/similarity.pkl
 model/similarity.pkl
 .vercel
 .env*
+.venv/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+!.env.example

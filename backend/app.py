@@ -1,350 +1,113 @@
+﻿
 import os
 import time
-import pickle
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import urllib.request
-# ---------------------------------
-# Load Environment Variables
-# ---------------------------------
-load_dotenv()
+from rules import load_movies, recommend
 
-TMDB_TOKEN = os.getenv("TMDB_TOKEN")
-
+load_dotenv(Path(__file__).with_name('.env'))
+TMDB_TOKEN = os.getenv('TMDB_TOKEN', '')
+TMDB_API_KEY = os.getenv('TMDB_API_KEY', '')
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=['http://localhost:5173', 'http://127.0.0.1:5173'])
+movies = load_movies()
+cache = {}
 
-# ---------------------------------
-# Reuse HTTP Session
-# ---------------------------------
-session = requests.Session()
 
-# ---------------------------------
-# Load AI Model
-# ---------------------------------
-movies = pickle.load(open("movies.pkl", "rb"))
-
-SIMILARITY_FILE = "similarity.pkl"
-
-if not os.path.exists(SIMILARITY_FILE):
-    print("Downloading similarity.pkl...")
-
-    url = "https://huggingface.co/Subham5126/movie-recommendation-model/resolve/main/similarity.pkl"
-
-    urllib.request.urlretrieve(url, SIMILARITY_FILE)
-
-    print("Download complete!")
-
-similarity = pickle.load(open(SIMILARITY_FILE, "rb"))
-# ---------------------------------
-# Recommendation Function
-# ---------------------------------
-def recommend(movie):
+def tmdb(path):
+    if not TMDB_TOKEN and not TMDB_API_KEY:
+        return None, 'TMDB_TOKEN or TMDB_API_KEY is missing; showing the included dataset.'
+    headers = {'Authorization': 'Bearer ' + TMDB_TOKEN} if TMDB_TOKEN else {}
+    params = {} if TMDB_TOKEN else {'api_key': TMDB_API_KEY}
     try:
-        movie_index = movies[movies["title"] == movie].index[0]
-
-        distances = similarity[movie_index]
-
-        movies_list = sorted(
-            list(enumerate(distances)),
-            reverse=True,
-            key=lambda x: x[1]
-        )[1:6]
-
-        return [movies.iloc[i[0]].title for i in movies_list]
-
-    except Exception as e:
-        print("Recommendation Error:", e)
-        return []
-
-
-# ---------------------------------
-# 🔍 Search Movies (Autocomplete)
-# ---------------------------------
-@app.route("/search", methods=["GET"])
-def search_movies():
-
-    query = request.args.get("q", "").strip().lower()
-
-    if not query:
-        return jsonify([])
-
-    results = (
-        movies[movies["title"].str.lower().str.contains(query, na=False)]
-        .head(8)["title"]
-        .tolist()
-    )
-
-    return jsonify(results)
-
-
-# ---------------------------------
-# Fetch Trailer
-# ---------------------------------
-def fetch_trailer(tmdb_id):
-
-    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}/videos"
-
-    headers = {
-        "Authorization": f"Bearer {TMDB_TOKEN}",
-        "accept": "application/json"
-    }
-
-    try:
-
-        response = session.get(
-            url,
-            headers=headers,
-            timeout=10
-        )
-
+        # Retry one transient connection/timeout failure, keeping credentials
+        # out of logs and error responses.
+        for attempt in range(2):
+            try:
+                response = requests.get('https://api.themoviedb.org/3/' + path, headers=headers, params=params, timeout=(3, 5))
+                break
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt:
+                    raise
+        if response.status_code in (401, 403):
+            return None, f'TMDB authentication rejected (HTTP {response.status_code}). Check backend/.env.'
         response.raise_for_status()
-
-        videos = response.json().get("results", [])
-
-        for video in videos:
-            if (
-                video.get("site") == "YouTube"
-                and video.get("type") == "Trailer"
-            ):
-                return f"https://www.youtube.com/watch?v={video['key']}"
-
-        for video in videos:
-            if video.get("site") == "YouTube":
-                return f"https://www.youtube.com/watch?v={video['key']}"
-
-    except Exception as e:
-        print("Trailer Error:", e)
-
-    return None
+        return response.json(), None
+    except requests.Timeout:
+        return None, 'TMDB connection timed out; showing the included dataset.'
+    except requests.HTTPError as error:
+        return None, f'TMDB returned HTTP {error.response.status_code}; showing the included dataset.'
+    except requests.RequestException:
+        return None, 'TMDB network or HTTP failure; showing the included dataset.'
+    except ValueError:
+        return None, 'TMDB returned an invalid response; showing the included dataset.'
 
 
-# ---------------------------------
-# Fetch Movie Details
-# ---------------------------------
-def fetch_movie_details(movie_name):
+def enrich(movie):
+    key = movie['tmdb_id']
+    entry = cache.get(key)
+    if entry and time.monotonic() - entry[0] < (600 if entry[1] else 15):
+        data, error = entry[1:]
+    else:
+        data, error = tmdb(f'movie/{key}?append_to_response=videos')
+        cache[key] = (time.monotonic(), data, error)
+    if not data:
+        return dict(movie, live_warning=error)
+    videos = data.get('videos', {}).get('results', [])
+    trailer = next((v for v in videos if v.get('site') == 'YouTube' and v.get('type') == 'Trailer'), None)
+    return dict(movie, overview=data.get('overview') or movie['overview'], poster='https://image.tmdb.org/t/p/w500' + data['poster_path'] if data.get('poster_path') else None, live_rating=data.get('vote_average'), live_genres=[g['name'] for g in data.get('genres', [])], live_release_date=data.get('release_date'), trailer='https://www.youtube.com/watch?v=' + trailer['key'] if trailer else None, source='TMDB + local rule data')
 
-    if not TMDB_TOKEN:
-        print("TMDB Token missing!")
-        return None
 
-    url = "https://api.themoviedb.org/3/search/movie"
+def enrich_all(items):
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        return list(pool.map(enrich, items))
 
-    headers = {
-        "Authorization": f"Bearer {TMDB_TOKEN}",
-        "accept": "application/json"
-    }
 
-    params = {
-        "query": movie_name
-    }
+def payload(items, key):
+    return {'success': True, key: items, 'count': len(items), 'warning': next((m['live_warning'] for m in items if m.get('live_warning')), None)}
 
-    for attempt in range(3):
 
-        try:
+@app.get('/')
+def health():
+    return jsonify(message='Rule-based movie API running', catalog_size=len(movies), token_configured=bool(TMDB_TOKEN or TMDB_API_KEY))
 
-            response = session.get(
-                url,
-                headers=headers,
-                params=params,
-                timeout=10
-            )
 
-            response.raise_for_status()
+@app.get('/tmdb-status')
+def tmdb_status():
+    data, error = tmdb('authentication')
+    connected = bool(data and data.get('success'))
+    message = error or ('TMDB authentication succeeded.' if connected else 'TMDB authentication could not be confirmed.')
+    return jsonify(connected=connected, message=message, error=None if connected else message), 200 if connected else 503
 
-            data = response.json()
 
-            if not data.get("results"):
-                return None
+@app.get('/filters')
+def filters():
+    return jsonify(genres=sorted({g for m in movies for g in m['genres']}), languages=sorted({m['language'] for m in movies}))
 
-            movie = data["results"][0]
 
-            poster = None
+@app.get('/search')
+def search():
+    query = request.args.get('q', '').strip().casefold()
+    return jsonify([m['title'] for m in movies if query and query in m['title'].casefold()][:8])
 
-            if movie.get("poster_path"):
-                poster = (
-                    f"https://image.tmdb.org/t/p/w500"
-                    f"{movie['poster_path']}"
-                )
 
-            trailer = fetch_trailer(movie["id"])
+@app.get('/popular')
+def popular():
+    return jsonify(payload(enrich_all(sorted(movies, key=lambda m: m['popularity'], reverse=True)[:12]), 'movies'))
 
-            return {
-                "tmdb_id": movie.get("id"),
-                "title": movie.get("title"),
-                "poster": poster,
-                "rating": movie.get("vote_average"),
-                "overview": movie.get("overview"),
-                "release_date": movie.get("release_date"),
-                "language": movie.get("original_language", "").upper(),
-                "popularity": movie.get("popularity"),
-                "vote_count": movie.get("vote_count"),
-                "adult": movie.get("adult", False),
-                "trailer": trailer
-            }
 
-        except requests.exceptions.RequestException as e:
-
-            print(f"Retry {attempt + 1}/3 : {movie_name}")
-
-            if attempt == 2:
-                print("TMDB Error:", e)
-                return None
-
-            time.sleep(1)
-
-# ---------------------------------
-# Fetch Popular Movies
-# ---------------------------------
-def fetch_popular_movies():
-
-    url = "https://api.themoviedb.org/3/movie/popular"
-
-    headers = {
-        "Authorization": f"Bearer {TMDB_TOKEN}",
-        "accept": "application/json"
-    }
-
+@app.post('/recommend')
+def recommendations():
     try:
-
-        response = session.get(
-            url,
-            headers=headers,
-            timeout=10
-        )
-        response.raise_for_status()
-        print(response.status_code)
-        print(response.json())
-        data = response.json()
-
-        popular_movies = []
-
-        for movie in data.get("results", [])[:20]:
-
-            poster = None
-
-            if movie.get("poster_path"):
-                poster = (
-                    f"https://image.tmdb.org/t/p/w500"
-                    f"{movie['poster_path']}"
-                )
-
-            trailer = fetch_trailer(movie["id"])
-
-            popular_movies.append({
-                "tmdb_id": movie.get("id"),
-                "title": movie.get("title"),
-                "poster": poster,
-                "rating": movie.get("vote_average"),
-                "overview": movie.get("overview"),
-                "release_date": movie.get("release_date"),
-                "language": movie.get("original_language", "").upper(),
-                "popularity": movie.get("popularity"),
-                "vote_count": movie.get("vote_count"),
-                "adult": movie.get("adult", False),
-                "trailer": trailer
-            })
-
-        return popular_movies
-
-    except Exception as e:
-        print("Popular Movies Error:", e)
-        return []
-
-# ---------------------------------
-# Home Route
-# ---------------------------------
-@app.route("/")
-def home():
-    return jsonify({
-        "message": "🎬 Movie Recommendation API Running"
-    })
-
-# ---------------------------------
-# Popular Movies Route
-# ---------------------------------
-@app.route("/popular", methods=["GET"])
-def popular_movies():
-
-    movies = fetch_popular_movies()
-
-    return jsonify({
-        "success": True,
-        "count": len(movies),
-        "movies": movies
-    })
-
-# ---------------------------------
-# Recommendation Route
-# ---------------------------------
-@app.route("/recommend", methods=["POST"])
-def recommend_movies():
-
-    try:
-
-        data = request.get_json()
-
-        if not data:
-            return jsonify({
-                "success": False,
-                "error": "No request body received."
-            }), 400
-
-        movie_name = data.get("movie", "").strip()
-
-        if not movie_name:
-            return jsonify({
-                "success": False,
-                "error": "Movie name is required."
-            }), 400
-
-        recommended_titles = recommend(movie_name)
-
-        if not recommended_titles:
-            return jsonify({
-                "success": False,
-                "error": "Movie not found."
-            }), 404
-
-        recommendations = []
-
-        for title in recommended_titles:
-
-            print(f"Searching TMDB: {title}")
-
-            details = fetch_movie_details(title)
-
-            if details:
-                recommendations.append(details)
-
-        return jsonify({
-            "success": True,
-            "count": len(recommendations),
-            "recommendations": recommendations
-        })
-
-    except Exception as e:
-
-        print("Backend Error:", e)
-
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        selected = recommend(movies, request.get_json(silent=True))
+    except ValueError as error:
+        return jsonify(success=False, error=str(error)), 400
+    return jsonify(payload(enrich_all(selected), 'recommendations'))
 
 
-# ---------------------------------
-# Run Flask
-# ---------------------------------
-if __name__ == "__main__":
-
-    print("=" * 50)
-    print("🎬 Movie Recommendation API")
-    print("=" * 50)
-    print("TMDB Token Loaded:", bool(TMDB_TOKEN))
-    print("=" * 50)
-
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=int(os.getenv('PORT', '5000')))
